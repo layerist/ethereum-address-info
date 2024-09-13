@@ -3,7 +3,7 @@ import logging
 from typing import Dict, List, Optional
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class EthereumAPIError(Exception):
@@ -15,27 +15,31 @@ class EthereumAddressInfo:
         self.api_key = api_key
         self.address = address
         self.base_url = 'https://api.etherscan.io/api'
-        self.session = requests.Session()
 
     def _make_request(self, params: Dict[str, str]) -> dict:
         """Internal method to make API requests."""
         params['apikey'] = self.api_key
         try:
-            response = self.session.get(self.base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('status') == '1':
-                return data['result']
-            else:
-                error_message = data.get('message', 'Unknown error occurred')
-                logger.error(f"API Error: {error_message}")
-                raise EthereumAPIError(error_message)
+            with requests.Session() as session:
+                response = session.get(self.base_url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('status') == '1':
+                    return data['result']
+                else:
+                    error_message = data.get('message', 'Unknown error occurred')
+                    logger.error(f"API Error: {error_message}")
+                    raise EthereumAPIError(error_message)
         except requests.exceptions.RequestException as e:
             logger.exception("HTTP Request failed")
             raise EthereumAPIError(f"HTTP Request failed: {e}")
         except ValueError as e:
             logger.exception("JSON Decoding failed")
             raise EthereumAPIError(f"JSON Decoding failed: {e}")
+        except Exception as e:
+            logger.exception("An unexpected error occurred")
+            raise EthereumAPIError(f"Unexpected error: {e}")
 
     def get_balance(self) -> float:
         """Retrieve the balance of the Ethereum address in Ether."""
@@ -50,7 +54,7 @@ class EthereumAddressInfo:
         logger.info(f"Retrieved balance: {balance:.18f} ETH")
         return balance
 
-    def get_transactions(self, start_block: Optional[int] = 0, end_block: Optional[int] = 99999999) -> List[Dict]:
+    def get_transactions(self, start_block: int = 0, end_block: int = 99999999) -> List[Dict]:
         """Retrieve the list of transactions for the Ethereum address."""
         params = {
             'module': 'account',
@@ -85,15 +89,17 @@ if __name__ == "__main__":
     eth_info = EthereumAddressInfo(api_key, address)
 
     try:
+        # Retrieve Ether balance
         balance = eth_info.get_balance()
         logger.info(f"Balance: {balance:.18f} ETH")
         
+        # Retrieve transaction history
         transactions = eth_info.get_transactions()
         logger.info("Transactions:")
         for tx in transactions:
             logger.info(tx)
         
-        # Example for token balance (use your specific contract address)
+        # Retrieve ERC-20 token balance (example contract address)
         contract_address = 'YourTokenContractAddress'
         token_balance = eth_info.get_token_balance(contract_address)
         logger.info(f"Token Balance: {token_balance:.18f}")
