@@ -20,20 +20,18 @@ class EthereumAddressInfo:
         self.retries = retries
         self.session = requests.Session()  # Session reuse for better performance
 
-    def __enter__(self):
+    def __enter__(self) -> "EthereumAddressInfo":
         """Enter context for session management."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit context and close session."""
         self.session.close()
 
     def _make_request(self, params: Dict[str, str]) -> Any:
         """Internal method to make API requests with retry mechanism."""
         params['apikey'] = self.api_key
-        attempt = 0
-
-        while attempt < self.retries:
+        for attempt in range(self.retries):
             try:
                 logger.debug(f"Attempt {attempt + 1}: Request parameters - {params}")
                 response = self.session.get(self.base_url, params=params, timeout=self.timeout)
@@ -48,8 +46,7 @@ class EthereumAddressInfo:
                     raise EthereumAPIError(error_message)
 
             except (HTTPError, Timeout) as e:
-                logger.warning(f"HTTP or Timeout Error: {e}, retrying...")
-                attempt += 1
+                logger.warning(f"Error: {e}, retrying ({attempt + 1}/{self.retries})...")
             except RequestException as e:
                 logger.error(f"Request Exception: {e}")
                 raise EthereumAPIError(f"Request Exception: {e}")
@@ -59,7 +56,7 @@ class EthereumAddressInfo:
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
                 raise EthereumAPIError(f"Unexpected error: {e}")
-
+        
         raise EthereumAPIError("Max retries exceeded")
 
     def get_balance(self) -> float:
