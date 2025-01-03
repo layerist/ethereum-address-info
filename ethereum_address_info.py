@@ -1,11 +1,20 @@
+import os
 import requests
 import logging
 from typing import Dict, List, Optional, Any
 from requests.exceptions import Timeout, HTTPError, RequestException
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Custom logger setup
+def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    return logger
+
+logger = setup_logger(__name__)
 
 class EthereumAPIError(Exception):
     """Custom exception for Ethereum API errors."""
@@ -20,6 +29,7 @@ class EthereumAddressInfo:
         self.timeout = timeout
         self.retries = retries
         self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "EthereumAPIClient/1.0"})
         logger.setLevel(log_level)
 
     def __enter__(self) -> "EthereumAddressInfo":
@@ -44,7 +54,7 @@ class EthereumAddressInfo:
                     return data["result"]
                 else:
                     error_message = data.get("message", "Unknown error occurred")
-                    logger.error(f"API Error: {error_message}")
+                    logger.error(f"API Error (status {response.status_code}): {error_message}")
                     raise EthereumAPIError(f"API Error: {error_message} | Params: {params}")
 
             except (HTTPError, Timeout) as e:
@@ -55,11 +65,13 @@ class EthereumAddressInfo:
             except ValueError as e:
                 logger.error(f"Failed to decode JSON: {e}")
                 raise EthereumAPIError(f"Failed to decode JSON: {e}")
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                raise EthereumAPIError(f"Unexpected error: {e}")
 
         raise EthereumAPIError("Max retries exceeded.")
+
+    @staticmethod
+    def _convert_wei_to_eth(wei: str) -> float:
+        """Convert Wei to Ether."""
+        return int(wei) / 1e18
 
     def get_balance(self) -> float:
         """Retrieve the Ether balance of the Ethereum address."""
@@ -70,7 +82,7 @@ class EthereumAddressInfo:
             "tag": "latest",
         }
         result = self._make_request(params)
-        balance = int(result) / 1e18  # Convert Wei to Ether
+        balance = self._convert_wei_to_eth(result)
         logger.info(f"Balance: {balance:.18f} ETH")
         return balance
 
@@ -98,29 +110,25 @@ class EthereumAddressInfo:
             "tag": "latest",
         }
         result = self._make_request(params)
-        token_balance = int(result) / 1e18  # Convert to token's unit
+        token_balance = self._convert_wei_to_eth(result)
         logger.info(f"Token Balance: {token_balance:.18f}")
         return token_balance
 
 if __name__ == "__main__":
-    # Replace placeholders with your actual API key and Ethereum address
-    api_key = "YourEtherscanAPIKey"
-    address = "YourEthereumAddress"
+    api_key = os.getenv("ETHERSCAN_API_KEY", "YourEtherscanAPIKey")
+    address = os.getenv("ETHEREUM_ADDRESS", "YourEthereumAddress")
 
     with EthereumAddressInfo(api_key, address, log_level=logging.DEBUG) as eth_info:
         try:
-            # Retrieve Ether balance
             balance = eth_info.get_balance()
             logger.info(f"Ether Balance: {balance:.18f} ETH")
 
-            # Retrieve transaction history
             transactions = eth_info.get_transactions()
             logger.info("Transactions:")
-            for tx in transactions[:5]:  # Log the first 5 transactions
+            for tx in transactions[:5]:
                 logger.debug(tx)
 
-            # Retrieve ERC-20 token balance
-            contract_address = "YourTokenContractAddress"
+            contract_address = os.getenv("TOKEN_CONTRACT_ADDRESS", "YourTokenContractAddress")
             token_balance = eth_info.get_token_balance(contract_address)
             logger.info(f"ERC-20 Token Balance: {token_balance:.18f}")
 
