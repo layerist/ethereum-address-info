@@ -79,14 +79,20 @@ class EthereumAddressInfo:
 
     def get_transactions(self, start_block: int = 0, end_block: int = 99999999) -> List[Dict[str, Any]]:
         """Retrieve transaction history."""
-        params = {"module": "account", "action": "txlist", "address": self.address, "startblock": str(start_block), "endblock": str(end_block), "sort": "asc"}
+        params = {
+            "module": "account", "action": "txlist", "address": self.address,
+            "startblock": str(start_block), "endblock": str(end_block), "sort": "asc"
+        }
         transactions = self._make_request(params)
         logger.info(f"Retrieved {len(transactions)} transactions.")
         return transactions
 
     def get_token_balance(self, contract_address: str) -> float:
         """Retrieve ERC-20 token balance."""
-        params = {"module": "account", "action": "tokenbalance", "contractaddress": contract_address, "address": self.address, "tag": "latest"}
+        params = {
+            "module": "account", "action": "tokenbalance", "contractaddress": contract_address,
+            "address": self.address, "tag": "latest"
+        }
         token_balance = self._convert_wei_to_eth(self._make_request(params))
         logger.info(f"Token Balance: {token_balance:.18f}")
         return token_balance
@@ -99,17 +105,18 @@ if __name__ == "__main__":
         logger.error("Missing required environment variables: ETHERSCAN_API_KEY or ETHEREUM_ADDRESS.")
         exit(1)
 
-    with EthereumAddressInfo(api_key, address, log_level=logging.DEBUG) as eth_info:
-        try:
+    try:
+        with EthereumAddressInfo(api_key, address, log_level=logging.DEBUG) as eth_info:
             logger.info(f"Ether Balance: {eth_info.get_balance():.18f} ETH")
             transactions = eth_info.get_transactions()
             logger.info(f"Displaying first 5 transactions:")
             for tx in transactions[:5]:
                 logger.debug(tx)
+            
             contract_address = os.getenv("TOKEN_CONTRACT_ADDRESS", "")
             if contract_address:
                 logger.info(f"ERC-20 Token Balance: {eth_info.get_token_balance(contract_address):.18f}")
-        except EthereumAPIError as e:
-            logger.error(f"Ethereum API Error: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected Error: {e}")
+    except EthereumAPIError as e:
+        logger.error(f"Ethereum API Error: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected Error: {e}")
