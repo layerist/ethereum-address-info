@@ -2,7 +2,7 @@ import os
 import requests
 import logging
 from time import sleep
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from requests.exceptions import Timeout, HTTPError, RequestException
 
 # Logger setup
@@ -25,12 +25,9 @@ class EthereumAPIError(Exception):
 class EthereumAddressInfo:
     BASE_URL = "https://api.etherscan.io/api"
     MAX_RETRIES = 3
-    RETRY_BACKOFF = 2  # Exponential backoff base time in seconds
+    RETRY_BACKOFF = 2  # Base backoff in seconds
 
     def __init__(self, api_key: str, address: str, timeout: int = 10, log_level: int = logging.INFO) -> None:
-        """
-        Initializes the EthereumAddressInfo class.
-        """
         self.api_key = api_key
         self.address = address
         self.timeout = timeout
@@ -45,9 +42,7 @@ class EthereumAddressInfo:
         self.session.close()
 
     def _make_request(self, params: Dict[str, str]) -> Any:
-        """
-        Makes a request to the Ethereum API with retries.
-        """
+        """Makes a request to the Ethereum API with retries."""
         params["apikey"] = self.api_key
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
@@ -59,11 +54,11 @@ class EthereumAddressInfo:
                 raise EthereumAPIError(f"API Error: {data.get('message', 'Unknown error')}")
             except (HTTPError, Timeout) as e:
                 logger.warning(f"{e} (Attempt {attempt}/{self.MAX_RETRIES}), retrying...")
-                sleep(self.RETRY_BACKOFF ** (attempt - 1))
+                sleep(min(self.RETRY_BACKOFF ** attempt, 10))  # Capped exponential backoff
             except RequestException as e:
                 raise EthereumAPIError(f"Request failed: {e}")
-            except ValueError as e:
-                raise EthereumAPIError(f"Invalid JSON response: {e}")
+            except (ValueError, KeyError) as e:
+                raise EthereumAPIError(f"Invalid API response: {e}")
         raise EthereumAPIError("Max retries exceeded.")
 
     @staticmethod
@@ -87,8 +82,11 @@ class EthereumAddressInfo:
         logger.info(f"Retrieved {len(transactions)} transactions.")
         return transactions
 
-    def get_token_balance(self, contract_address: str) -> float:
+    def get_token_balance(self, contract_address: str) -> Optional[float]:
         """Retrieve ERC-20 token balance."""
+        if not contract_address:
+            logger.warning("Contract address is empty.")
+            return None
         params = {
             "module": "account", "action": "tokenbalance", "contractaddress": contract_address,
             "address": self.address, "tag": "latest"
@@ -100,6 +98,7 @@ class EthereumAddressInfo:
 if __name__ == "__main__":
     api_key = os.getenv("ETHERSCAN_API_KEY")
     address = os.getenv("ETHEREUM_ADDRESS")
+    contract_address = os.getenv("TOKEN_CONTRACT_ADDRESS", "")
 
     if not api_key or not address:
         logger.error("Missing required environment variables: ETHERSCAN_API_KEY or ETHEREUM_ADDRESS.")
@@ -112,11 +111,12 @@ if __name__ == "__main__":
             logger.info(f"Displaying first 5 transactions:")
             for tx in transactions[:5]:
                 logger.debug(tx)
-            
-            contract_address = os.getenv("TOKEN_CONTRACT_ADDRESS", "")
+
             if contract_address:
-                logger.info(f"ERC-20 Token Balance: {eth_info.get_token_balance(contract_address):.18f}")
+                token_balance = eth_info.get_token_balance(contract_address)
+                if token_balance is not None:
+                    logger.info(f"ERC-20 Token Balance: {token_balance:.18f}")
     except EthereumAPIError as e:
-        logger.error(f"Ethereum API Error: {e}")
+        logger.error(f"Ethereum API Error: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Unexpected Error: {e}")
+        logger.error(f"Unexpected Error: {e}", exc_info=True)
