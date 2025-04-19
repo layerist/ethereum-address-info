@@ -1,17 +1,23 @@
 import os
-import requests
 import logging
 from time import sleep
 from typing import Dict, List, Any, Optional
+
+import requests
 from requests.exceptions import Timeout, HTTPError, RequestException
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Logger setup
 def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Sets up and returns a logger."""
+    """Configure and return a logger."""
     logger = logging.getLogger(name)
     if not logger.hasHandlers():
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     logger.setLevel(level)
     return logger
@@ -19,13 +25,13 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 logger = setup_logger(__name__)
 
 class EthereumAPIError(Exception):
-    """Custom exception for Ethereum API errors."""
+    """Raised when an Ethereum API call fails after retries."""
     pass
 
 class EthereumAddressInfo:
-    BASE_URL = "https://api.etherscan.io/api"
-    MAX_RETRIES = 3
-    RETRY_BACKOFF = 2  # Base backoff in seconds
+    BASE_URL: str = "https://api.etherscan.io/api"
+    MAX_RETRIES: int = 3
+    RETRY_BACKOFF: int = 2  # Base backoff (seconds)
 
     def __init__(self, api_key: str, address: str, timeout: int = 10, log_level: int = logging.INFO) -> None:
         self.api_key = api_key
@@ -42,8 +48,9 @@ class EthereumAddressInfo:
         self.session.close()
 
     def _make_request(self, params: Dict[str, str]) -> Any:
-        """Makes a request to the Ethereum API with retries."""
+        """Makes a request to the Etherscan API with retry logic."""
         params["apikey"] = self.api_key
+
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 response = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
@@ -51,72 +58,94 @@ class EthereumAddressInfo:
                 data = response.json()
                 if data.get("status") == "1":
                     return data["result"]
-                raise EthereumAPIError(f"API Error: {data.get('message', 'Unknown error')}")
+                raise EthereumAPIError(f"Etherscan API error: {data.get('message', 'Unknown error')}")
             except (HTTPError, Timeout) as e:
                 logger.warning(f"{e} (Attempt {attempt}/{self.MAX_RETRIES}), retrying...")
-                sleep(min(self.RETRY_BACKOFF ** attempt, 10))  # Capped exponential backoff
+                sleep(min(self.RETRY_BACKOFF ** attempt, 10))
             except RequestException as e:
                 raise EthereumAPIError(f"Request failed: {e}")
             except (ValueError, KeyError) as e:
-                raise EthereumAPIError(f"Invalid API response: {e}")
-        raise EthereumAPIError("Max retries exceeded.")
+                raise EthereumAPIError(f"Invalid response format: {e}")
+
+        raise EthereumAPIError("Exceeded maximum number of retries.")
 
     @staticmethod
     def _convert_wei_to_eth(wei: str) -> float:
-        return int(wei) / 1e18
+        """Converts Wei to ETH."""
+        try:
+            return int(wei) / 1e18
+        except (ValueError, TypeError):
+            logger.warning("Failed to convert Wei to ETH.")
+            return 0.0
 
     def get_balance(self) -> float:
-        """Retrieve the Ether balance."""
-        params = {"module": "account", "action": "balance", "address": self.address, "tag": "latest"}
-        balance = self._convert_wei_to_eth(self._make_request(params))
-        logger.info(f"Balance: {balance:.18f} ETH")
-        return balance
+        """Retrieve Ether balance."""
+        params = {
+            "module": "account",
+            "action": "balance",
+            "address": self.address,
+            "tag": "latest"
+        }
+        balance_wei = self._make_request(params)
+        balance_eth = self._convert_wei_to_eth(balance_wei)
+        logger.info(f"ETH Balance: {balance_eth:.18f}")
+        return balance_eth
 
     def get_transactions(self, start_block: int = 0, end_block: int = 99999999) -> List[Dict[str, Any]]:
-        """Retrieve transaction history."""
+        """Retrieve normal transactions."""
         params = {
-            "module": "account", "action": "txlist", "address": self.address,
-            "startblock": str(start_block), "endblock": str(end_block), "sort": "asc"
+            "module": "account",
+            "action": "txlist",
+            "address": self.address,
+            "startblock": str(start_block),
+            "endblock": str(end_block),
+            "sort": "asc"
         }
         transactions = self._make_request(params)
-        logger.info(f"Retrieved {len(transactions)} transactions.")
+        logger.info(f"Fetched {len(transactions)} transactions.")
         return transactions
 
     def get_token_balance(self, contract_address: str) -> Optional[float]:
-        """Retrieve ERC-20 token balance."""
+        """Retrieve ERC-20 token balance by contract address."""
         if not contract_address:
-            logger.warning("Contract address is empty.")
+            logger.warning("No contract address provided.")
             return None
         params = {
-            "module": "account", "action": "tokenbalance", "contractaddress": contract_address,
-            "address": self.address, "tag": "latest"
+            "module": "account",
+            "action": "tokenbalance",
+            "contractaddress": contract_address,
+            "address": self.address,
+            "tag": "latest"
         }
-        token_balance = self._convert_wei_to_eth(self._make_request(params))
-        logger.info(f"Token Balance: {token_balance:.18f}")
-        return token_balance
+        balance_wei = self._make_request(params)
+        balance_eth = self._convert_wei_to_eth(balance_wei)
+        logger.info(f"Token Balance: {balance_eth:.18f}")
+        return balance_eth
 
-if __name__ == "__main__":
+def main():
     api_key = os.getenv("ETHERSCAN_API_KEY")
     address = os.getenv("ETHEREUM_ADDRESS")
     contract_address = os.getenv("TOKEN_CONTRACT_ADDRESS", "")
 
     if not api_key or not address:
         logger.error("Missing required environment variables: ETHERSCAN_API_KEY or ETHEREUM_ADDRESS.")
-        exit(1)
+        return
 
     try:
-        with EthereumAddressInfo(api_key, address, log_level=logging.DEBUG) as eth_info:
-            logger.info(f"Ether Balance: {eth_info.get_balance():.18f} ETH")
-            transactions = eth_info.get_transactions()
-            logger.info(f"Displaying first 5 transactions:")
+        with EthereumAddressInfo(api_key, address, log_level=logging.DEBUG) as eth:
+            eth.get_balance()
+            transactions = eth.get_transactions()
+            logger.info("First 5 transactions:")
             for tx in transactions[:5]:
                 logger.debug(tx)
 
             if contract_address:
-                token_balance = eth_info.get_token_balance(contract_address)
-                if token_balance is not None:
-                    logger.info(f"ERC-20 Token Balance: {token_balance:.18f}")
+                eth.get_token_balance(contract_address)
+
     except EthereumAPIError as e:
         logger.error(f"Ethereum API Error: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Unexpected Error: {e}", exc_info=True)
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()
