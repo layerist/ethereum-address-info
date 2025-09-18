@@ -9,7 +9,10 @@ from requests import Session
 from requests.exceptions import Timeout, HTTPError, RequestException
 from dotenv import load_dotenv
 
+
+# ----------------------------
 # Load environment variables
+# ----------------------------
 load_dotenv()
 
 
@@ -21,7 +24,9 @@ def setup_logger(name: str = "EthereumAPI", level: int = logging.INFO) -> loggin
     logger = logging.getLogger(name)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
     logger.setLevel(level)
@@ -44,8 +49,9 @@ class EthereumAPIError(Exception):
 class EthereumAddressInfo:
     BASE_URL: str = "https://api.etherscan.io/api"
     MAX_RETRIES: int = 3
-    BACKOFF_BASE: int = 2
-    MAX_BACKOFF: int = 10  # seconds
+    BACKOFF_BASE: float = 2.0
+    MAX_BACKOFF: float = 10.0  # seconds
+    RATE_LIMIT_WAIT: int = 5   # seconds to wait if hitting rate limit
 
     def __init__(
         self,
@@ -64,7 +70,7 @@ class EthereumAddressInfo:
         self.timeout = timeout
 
         self.session: Session = requests.Session()
-        self.session.headers.update({"User-Agent": "EthereumAPIClient/1.1"})
+        self.session.headers.update({"User-Agent": "EthereumAPIClient/1.2"})
 
         logger.setLevel(log_level)
 
@@ -74,34 +80,47 @@ class EthereumAddressInfo:
     def __exit__(self, *_: Any) -> None:
         self.session.close()
 
+    # ----------------------------
+    # Internal Helpers
+    # ----------------------------
     def _make_request(self, params: Dict[str, str]) -> Union[str, List[Dict[str, Any]]]:
-        """Make a GET request to the Etherscan API with retries and backoff."""
+        """Make a GET request to the Etherscan API with retries and exponential backoff."""
         params["apikey"] = self.api_key
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                response = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
+                response = self.session.get(
+                    self.BASE_URL, params=params, timeout=self.timeout
+                )
                 response.raise_for_status()
                 data = response.json()
 
+                # Normal successful response
                 if data.get("status") == "1" and "result" in data:
                     return data["result"]
 
+                # API error (including rate limits)
                 if data.get("message") == "NOTOK":
-                    if "Max rate limit" in str(data.get("result", "")):
-                        raise EthereumAPIError("Rate limit reached. Try again later.")
-                    raise EthereumAPIError(f"API error: {data.get('result', 'Unknown')}")
+                    result = str(data.get("result", "Unknown"))
+                    if "Max rate limit" in result:
+                        logger.warning("Rate limit reached. Waiting before retry...")
+                        time.sleep(self.RATE_LIMIT_WAIT)
+                        continue
+                    raise EthereumAPIError(f"API error: {result}")
 
                 raise EthereumAPIError(f"Unexpected API response: {data}")
 
             except (Timeout, HTTPError) as e:
-                delay = min(self.BACKOFF_BASE ** attempt + random.random(), self.MAX_BACKOFF)
-                logger.warning(f"[Attempt {attempt}] Network error: {e} (retrying in {delay:.2f}s)")
+                delay = min(self.BACKOFF_BASE ** attempt + random.uniform(0, 1), self.MAX_BACKOFF)
+                logger.warning(
+                    f"[Attempt {attempt}] Network error: {e} "
+                    f"(retrying in {delay:.2f}s)"
+                )
                 time.sleep(delay)
             except RequestException as e:
-                raise EthereumAPIError(f"Request failed: {e}")
+                raise EthereumAPIError(f"Request failed: {e}") from e
             except (ValueError, KeyError) as e:
-                raise EthereumAPIError(f"Invalid API response format: {e}")
+                raise EthereumAPIError(f"Invalid API response format: {e}") from e
 
         raise EthereumAPIError("All retry attempts failed.")
 
@@ -127,7 +146,7 @@ class EthereumAddressInfo:
         }
         wei = self._make_request(params)
         eth = self._convert_wei_to_eth(wei)
-        logger.info(f"ETH balance: {eth:.6f}")
+        logger.info(f"ETH balance for {self.address}: {eth:.6f}")
         return eth
 
     def get_transactions(
@@ -146,10 +165,12 @@ class EthereumAddressInfo:
             "sort": sort,
         }
         transactions = self._make_request(params)
-        logger.info(f"Retrieved {len(transactions)} transactions.")
+        logger.info(f"Retrieved {len(transactions)} transactions for {self.address}.")
         return transactions
 
-    def get_token_balance(self, contract_address: str, decimals: int = 18) -> Optional[float]:
+    def get_token_balance(
+        self, contract_address: str, decimals: int = 18
+    ) -> Optional[float]:
         """Get ERC-20 token balance for a given contract address."""
         if not contract_address:
             logger.warning("Contract address not provided.")
@@ -164,7 +185,10 @@ class EthereumAddressInfo:
         }
         wei = self._make_request(params)
         balance = self._convert_wei_to_eth(wei, decimals)
-        logger.info(f"Token balance [{contract_address}]: {balance:.6f}")
+        logger.info(
+            f"Token balance for {self.address} "
+            f"[contract: {contract_address}]: {balance:.6f}"
+        )
         return balance
 
 
@@ -178,7 +202,9 @@ def main() -> None:
     token_decimals = int(os.getenv("TOKEN_DECIMALS", "18"))
 
     if not api_key or not address:
-        logger.error("Missing required environment variables: ETHERSCAN_API_KEY or ETHEREUM_ADDRESS.")
+        logger.error(
+            "Missing required environment variables: ETHERSCAN_API_KEY or ETHEREUM_ADDRESS."
+        )
         return
 
     try:
