@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional, Union
 import requests
 from requests import Session
 from requests.exceptions import Timeout, HTTPError, RequestException
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    retry_if_exception_type,
+)
 from dotenv import load_dotenv
 
 
@@ -20,14 +25,19 @@ load_dotenv()
 # ============================================================
 # Logger Configuration
 # ============================================================
-def setup_logger(name: str = "EthereumAPI", level: int = logging.INFO) -> logging.Logger:
+def setup_logger(
+    name: str = "EthereumAPI",
+    level: int = logging.INFO,
+) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-        handler.setFormatter(formatter)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        )
         logger.addHandler(handler)
     logger.setLevel(level)
+    logger.propagate = False
     return logger
 
 
@@ -38,17 +48,17 @@ logger = setup_logger(level=logging.DEBUG)
 # Custom Exceptions
 # ============================================================
 class EthereumAPIError(Exception):
-    """General API exception."""
+    """General Ethereum API exception."""
 
 
 class EthereumRateLimitError(EthereumAPIError):
-    """Rate limit reached."""
+    """Raised when Etherscan rate limit is reached."""
 
 
 # ============================================================
 # Configuration Dataclass
 # ============================================================
-@dataclass
+@dataclass(frozen=True)
 class EthereumAPIConfig:
     api_key: str
     address: str
@@ -64,16 +74,17 @@ class EthereumAPIConfig:
 # ============================================================
 class EthereumAddressInfo:
     BASE_URL = "https://api.etherscan.io/api"
+    USER_AGENT = "EthereumAPIClient/3.1"
 
     def __init__(self, config: EthereumAPIConfig) -> None:
         if not config.api_key:
-            raise ValueError("Etherscan API key is required.")
+            raise ValueError("Etherscan API key is required")
         if not config.address:
-            raise ValueError("Ethereum address is required.")
+            raise ValueError("Ethereum address is required")
 
         self.config = config
         self.session: Session = requests.Session()
-        self.session.headers.update({"User-Agent": "EthereumAPIClient/3.0"})
+        self.session.headers.update({"User-Agent": self.USER_AGENT})
 
     def __enter__(self) -> "EthereumAddressInfo":
         return self
@@ -82,66 +93,79 @@ class EthereumAddressInfo:
         self.session.close()
 
     # ------------------------------------------------------------
-    # Core Request Handler With Retry
+    # Core Request Handler (with retry)
     # ------------------------------------------------------------
     @retry(
-        retry=retry_if_exception_type((Timeout, HTTPError, EthereumAPIError)),
+        retry=retry_if_exception_type(
+            (Timeout, HTTPError, EthereumAPIError)
+        ),
         wait=wait_exponential_jitter(multiplier=2, max=10),
         stop=stop_after_attempt(3),
-        reraise=True
+        reraise=True,
     )
     def _make_request(self, params: Dict[str, str]) -> Any:
+        params = dict(params)
         params["apikey"] = self.config.api_key
 
         try:
-            logger.debug(f"Requesting: {params}")
-            response = self.session.get(self.BASE_URL, params=params, timeout=self.config.timeout)
+            logger.debug("Request params: %s", params)
+            response = self.session.get(
+                self.BASE_URL,
+                params=params,
+                timeout=self.config.timeout,
+            )
             response.raise_for_status()
             data = response.json()
-        except Timeout:
-            logger.warning("Timeout occurred. Retrying...")
-            raise
+        except Timeout as e:
+            logger.warning("Request timeout")
+            raise e
         except HTTPError as e:
-            logger.warning(f"HTTP error: {e}. Retrying...")
-            raise
+            logger.warning("HTTP error: %s", e)
+            raise e
         except RequestException as e:
             raise EthereumAPIError(f"Network error: {e}") from e
 
         return self._handle_api_response(data)
 
     # ------------------------------------------------------------
-    # Specific Etherscan API checks
+    # Etherscan Response Handling
     # ------------------------------------------------------------
     def _handle_api_response(self, data: Dict[str, Any]) -> Any:
         status = data.get("status")
         message = data.get("message", "")
         result = data.get("result")
 
-        # Etherscan success
         if status == "1":
             return result
 
-        # Rate limit handling
-        if "Max rate limit" in str(result) or message == "NOTOK" and result == "Max rate limit reached":
-            logger.warning(f"Rate limit reached. Waiting {self.config.rate_limit_wait}s...")
+        if (
+            "rate limit" in str(result).lower()
+            or "rate limit" in message.lower()
+        ):
+            logger.warning(
+                "Rate limit reached, sleeping %ds",
+                self.config.rate_limit_wait,
+            )
             time.sleep(self.config.rate_limit_wait)
             raise EthereumRateLimitError("Rate limit reached")
 
-        # Empty success
         if status == "0" and result == "No transactions found":
             return []
 
-        raise EthereumAPIError(f"Etherscan API error: {message or result}")
+        raise EthereumAPIError(f"Etherscan error: {message or result}")
 
     # ------------------------------------------------------------
-    # Utility
+    # Utilities
     # ------------------------------------------------------------
     @staticmethod
-    def _convert_wei_to_eth(wei: Union[str, int], decimals: int = 18) -> float:
+    def _wei_to_eth(
+        wei: Union[str, int],
+        decimals: int = 18,
+    ) -> float:
         try:
             return int(wei) / (10 ** decimals)
-        except (ValueError, TypeError):
-            logger.debug(f"Invalid Wei value: {wei}")
+        except (TypeError, ValueError):
+            logger.debug("Invalid Wei value: %r", wei)
             return 0.0
 
     # ------------------------------------------------------------
@@ -155,15 +179,15 @@ class EthereumAddressInfo:
             "tag": "latest",
         }
         wei = self._make_request(params)
-        eth = self._convert_wei_to_eth(wei)
-        logger.info(f"Balance: {eth:.6f} ETH")
-        return eth
+        balance = self._wei_to_eth(wei)
+        logger.info("ETH balance: %.6f", balance)
+        return balance
 
     def get_transactions(
         self,
         start_block: int = 0,
         end_block: int = 99999999,
-        sort: str = "asc"
+        sort: str = "asc",
     ) -> List[Dict[str, Any]]:
         params = {
             "module": "account",
@@ -174,12 +198,16 @@ class EthereumAddressInfo:
             "sort": sort,
         }
         txs = self._make_request(params)
-        logger.info(f"Transactions: {len(txs)} found")
+        logger.info("Transactions found: %d", len(txs))
         return txs
 
-    def get_token_balance(self, contract_address: str, decimals: int = 18) -> Optional[float]:
+    def get_token_balance(
+        self,
+        contract_address: str,
+        decimals: int = 18,
+    ) -> Optional[float]:
         if not contract_address:
-            logger.warning("No contract address provided for token balance.")
+            logger.warning("Token contract address not provided")
             return None
 
         params = {
@@ -190,8 +218,12 @@ class EthereumAddressInfo:
             "tag": "latest",
         }
         wei = self._make_request(params)
-        balance = self._convert_wei_to_eth(wei, decimals)
-        logger.info(f"Token balance [{contract_address}]: {balance:.6f}")
+        balance = self._wei_to_eth(wei, decimals)
+        logger.info(
+            "Token balance [%s]: %.6f",
+            contract_address,
+            balance,
+        )
         return balance
 
 
@@ -205,18 +237,21 @@ def main() -> None:
     token_decimals = int(os.getenv("TOKEN_DECIMALS", "18"))
 
     if not api_key or not address:
-        logger.error("ETHERSCAN_API_KEY or ETHEREUM_ADDRESS missing.")
+        logger.error("Missing ETHERSCAN_API_KEY or ETHEREUM_ADDRESS")
         return
 
-    config = EthereumAPIConfig(api_key=api_key, address=address)
+    config = EthereumAPIConfig(
+        api_key=api_key,
+        address=address,
+    )
 
     try:
         with EthereumAddressInfo(config) as eth:
             eth.get_balance()
-            txs = eth.get_transactions()
 
+            txs = eth.get_transactions()
             if txs:
-                logger.debug("Sample transactions (first 3):")
+                logger.debug("First 3 transactions:")
                 for tx in txs[:3]:
                     logger.debug(tx)
 
@@ -224,11 +259,11 @@ def main() -> None:
                 eth.get_token_balance(contract_address, token_decimals)
 
     except EthereumRateLimitError:
-        logger.error("Too many API requests. Try again later.")
+        logger.error("Rate limit exceeded. Try again later.")
     except EthereumAPIError as e:
-        logger.error(f"API error: {e}")
-    except Exception as e:
-        logger.exception(f"Unexpected fatal error: {e}")
+        logger.error("Ethereum API error: %s", e)
+    except Exception:
+        logger.exception("Unexpected fatal error")
 
 
 if __name__ == "__main__":
