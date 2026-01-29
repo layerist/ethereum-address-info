@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Robust Ethereum address info client using Etherscan API.
+Robust Ethereum address info client using the Etherscan API.
 
-Features:
-- Typed configuration via dataclass
-- Automatic retries with exponential backoff
-- Rate-limit detection and handling
-- Persistent HTTP session
-- Structured logging
+Improvements:
+- Centralized retry/backoff config (no hard-coded values)
+- Clear separation of concerns (request / parsing / API methods)
+- Better error messages and logging context
+- Address normalization
+- Safer response validation
+- Minor typing and style cleanups
 """
 
 from __future__ import annotations
 
 import os
-import logging
 import time
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -87,13 +88,16 @@ class EthereumAPIConfig:
     max_backoff: float = 10.0
     rate_limit_wait: int = 5
 
+    def normalized_address(self) -> str:
+        return self.address.lower()
+
 
 # ============================================================
 # Client
 # ============================================================
 class EthereumAddressInfo:
     BASE_URL = "https://api.etherscan.io/api"
-    USER_AGENT = "EthereumAPIClient/4.0"
+    USER_AGENT = "EthereumAPIClient/4.1"
 
     def __init__(self, config: EthereumAPIConfig) -> None:
         if not config.api_key:
@@ -129,7 +133,7 @@ class EthereumAddressInfo:
         params = {**params, "apikey": self.config.api_key}
 
         try:
-            logger.debug("HTTP GET %s | params=%s", self.BASE_URL, params)
+            logger.debug("GET %s | params=%s", self.BASE_URL, params)
             response = self.session.get(
                 self.BASE_URL,
                 params=params,
@@ -137,12 +141,12 @@ class EthereumAddressInfo:
             )
             response.raise_for_status()
             payload = response.json()
-        except Timeout:
-            logger.warning("Request timeout")
-            raise
-        except HTTPError:
-            logger.warning("HTTP status error")
-            raise
+        except Timeout as exc:
+            logger.warning("Request timed out")
+            raise exc
+        except HTTPError as exc:
+            logger.warning("HTTP error: %s", exc)
+            raise exc
         except RequestException as exc:
             raise EthereumAPIError(f"Network error: {exc}") from exc
         except ValueError as exc:
@@ -157,7 +161,7 @@ class EthereumAddressInfo:
         if not isinstance(data, dict):
             raise EthereumResponseError("Unexpected response format")
 
-        status = data.get("status")
+        status = str(data.get("status"))
         message = str(data.get("message", "")).lower()
         result = data.get("result")
 
@@ -166,16 +170,18 @@ class EthereumAddressInfo:
 
         if "rate limit" in message or "rate limit" in str(result).lower():
             logger.warning(
-                "Rate limit reached, sleeping %ds",
+                "Rate limit hit, sleeping %ds",
                 self.config.rate_limit_wait,
             )
             time.sleep(self.config.rate_limit_wait)
-            raise EthereumRateLimitError("Rate limit reached")
+            raise EthereumRateLimitError("Rate limit exceeded")
 
         if status == "0" and result == "No transactions found":
             return []
 
-        raise EthereumAPIError(f"Etherscan error: {message or result}")
+        raise EthereumAPIError(
+            f"Etherscan error | status={status} | message={message} | result={result}"
+        )
 
     # ------------------------------------------------------------
     # Utilities
@@ -198,7 +204,7 @@ class EthereumAddressInfo:
         params = {
             "module": "account",
             "action": "balance",
-            "address": self.config.address,
+            "address": self.config.normalized_address(),
             "tag": "latest",
         }
         wei = self._request(params)
@@ -215,13 +221,13 @@ class EthereumAddressInfo:
         params = {
             "module": "account",
             "action": "txlist",
-            "address": self.config.address,
+            "address": self.config.normalized_address(),
             "startblock": str(start_block),
             "endblock": str(end_block),
             "sort": sort,
         }
         txs = self._request(params)
-        logger.info("Transactions found: %d", len(txs))
+        logger.info("Transactions fetched: %d", len(txs))
         return txs
 
     def get_token_balance(
@@ -236,8 +242,8 @@ class EthereumAddressInfo:
         params = {
             "module": "account",
             "action": "tokenbalance",
-            "contractaddress": contract_address,
-            "address": self.config.address,
+            "contractaddress": contract_address.lower(),
+            "address": self.config.normalized_address(),
             "tag": "latest",
         }
         wei = self._request(params)
@@ -280,7 +286,7 @@ def main() -> None:
                 eth.get_token_balance(contract_address, token_decimals)
 
     except EthereumRateLimitError:
-        logger.error("Rate limit exceeded. Try again later.")
+        logger.error("Rate limit exceeded. Please retry later.")
     except EthereumAPIError as exc:
         logger.error("Ethereum API error: %s", exc)
     except Exception:
