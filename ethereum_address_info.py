@@ -178,6 +178,7 @@ class EthereumAPIConfig:
     max_backoff: float = 20.0
 
     rate_limit_per_sec: float = 4.0
+    circuit_breaker_failures: int = 8
 
     max_workers: int = 4
     use_checksum: bool = False
