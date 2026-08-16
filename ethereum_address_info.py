@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production-oriented multichain Etherscan API V2 client.
+Production-oriented multichain Etherscan API V2 client (v3).
 
 Main features
 -------------
@@ -66,6 +66,7 @@ EMPTY_RESULT_MARKERS = (
     "no records found",
 )
 ACCOUNT_ACTIONS = frozenset({"txlist", "txlistinternal", "tokentx", "tokennfttx", "token1155tx"})
+TOKEN_ACTIONS = frozenset({"tokentx", "tokennfttx", "token1155tx"})
 
 
 class EtherscanError(RuntimeError):
@@ -94,6 +95,37 @@ class EtherscanResponse(TypedDict, total=False):
     result: Any
 
 
+@dataclass(slots=True)
+class AtomicOutput:
+    """Write to a sibling temporary file and replace the target only on success."""
+
+    final_path: Path
+    temp_path: Path
+    stream: TextIO
+    _finished: bool = False
+
+    def commit(self) -> None:
+        if self._finished:
+            return
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        self.stream.close()
+        os.replace(self.temp_path, self.final_path)
+        self._finished = True
+
+    def abort(self) -> None:
+        if self._finished:
+            return
+        try:
+            self.stream.close()
+        finally:
+            try:
+                self.temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._finished = True
+
+
 class TokenBucketRateLimiter:
     """Thread-safe token bucket shared by every worker."""
 
@@ -108,7 +140,15 @@ class TokenBucketRateLimiter:
 
         self._tokens = self._capacity
         self._updated_at = time.monotonic()
+        self._blocked_until = 0.0
         self._lock = threading.Lock()
+
+    def defer_for(self, delay: float) -> None:
+        """Globally pause all workers, e.g. after HTTP 429 / API rate-limit response."""
+        if delay <= 0:
+            return
+        with self._lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + delay)
 
     def acquire(self, stop_event: threading.Event) -> None:
         while True:
@@ -117,15 +157,18 @@ class TokenBucketRateLimiter:
 
             with self._lock:
                 now = time.monotonic()
-                elapsed = max(0.0, now - self._updated_at)
-                self._updated_at = now
-                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                if now < self._blocked_until:
+                    delay = self._blocked_until - now
+                else:
+                    elapsed = max(0.0, now - self._updated_at)
+                    self._updated_at = now
+                    self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
 
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
+                    if self._tokens >= 1.0:
+                        self._tokens -= 1.0
+                        return
 
-                delay = (1.0 - self._tokens) / self._rate
+                    delay = (1.0 - self._tokens) / self._rate
 
             if stop_event.wait(delay):
                 raise KeyboardInterrupt
@@ -197,10 +240,11 @@ class EtherscanConfig:
     rate_limit_per_sec: float = 3.0
     rate_limit_burst: float = 1.0
     max_workers: int = 3
+    pagination_window: int = 0
     page_size: int = 1000
     circuit_breaker_failures: int = 8
     circuit_breaker_recovery_sec: float = 30.0
-    user_agent: str = "etherscan-v2-client/2.0"
+    user_agent: str = "etherscan-v2-client/3.0"
     proxies: Optional[Mapping[str, str]] = None
     trust_env: bool = True
 
@@ -222,6 +266,8 @@ class EtherscanConfig:
             raise EtherscanValidationError("invalid backoff settings")
         if self.max_workers < 1:
             raise EtherscanValidationError("max_workers must be >= 1")
+        if self.pagination_window < 0:
+            raise EtherscanValidationError("pagination_window must be >= 0")
         if not 1 <= self.page_size <= 1000:
             raise EtherscanValidationError("page_size must be between 1 and 1000")
 
@@ -348,6 +394,11 @@ class EtherscanClient:
                 if attempt + 1 >= self.config.retries:
                     break
                 delay = self._retry_delay(attempt, response)
+                if (
+                    (response is not None and response.status_code == 429)
+                    or "rate limit" in str(exc).lower()
+                ):
+                    self._rate_limiter.defer_for(delay)
                 self._log_retry(safe_query, attempt, delay, exc)
                 self._wait(delay)
 
@@ -485,6 +536,10 @@ class EtherscanClient:
         page_size = offset if offset is not None else self.config.page_size
         validate_page_arguments(page, page_size, start_block, end_block, sort)
         target = normalize_address(address or self.config.address)
+        if contract_address and action not in TOKEN_ACTIONS:
+            raise EtherscanValidationError(
+                f"contract_address filter is not supported for action {action!r}"
+            )
         contract = (
             normalize_address(contract_address, field="contract_address")
             if contract_address
@@ -546,6 +601,18 @@ class EtherscanClient:
     def iter_transactions(self, **kwargs: Any) -> Iterator[dict[str, Any]]:
         yield from self.iter_account_records("txlist", **kwargs)
 
+    def iter_internal_transactions(self, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield from self.iter_account_records("txlistinternal", **kwargs)
+
+    def iter_erc20_transfers(self, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield from self.iter_account_records("tokentx", **kwargs)
+
+    def iter_erc721_transfers(self, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield from self.iter_account_records("tokennfttx", **kwargs)
+
+    def iter_erc1155_transfers(self, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield from self.iter_account_records("token1155tx", **kwargs)
+
     def _iter_pages_serial(
         self,
         *,
@@ -591,6 +658,8 @@ class EtherscanClient:
         next_submit = 1
         next_emit = 1
         terminal_page: Optional[int] = None
+        window = self.config.pagination_window or self.config.max_workers
+        window = max(self.config.max_workers, window)
         completed: dict[int, list[dict[str, Any]]] = {}
         in_flight: dict[Future[list[dict[str, Any]]], int] = {}
         executor = ThreadPoolExecutor(
@@ -603,6 +672,7 @@ class EtherscanClient:
                 not self._stop_event.is_set()
                 and (max_pages is None or page <= max_pages)
                 and (terminal_page is None or page <= terminal_page)
+                and page < next_emit + window
             )
 
         def submit(page: int) -> None:
@@ -625,7 +695,15 @@ class EtherscanClient:
                 next_submit += 1
 
             while in_flight:
-                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                if self._stop_event.is_set():
+                    raise KeyboardInterrupt
+                done, _ = wait(
+                    in_flight,
+                    timeout=0.25,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
                 for future in done:
                     page = in_flight.pop(future)
                     records = future.result()
@@ -707,9 +785,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chain-id", type=int, default=env_int("ETHERSCAN_CHAIN_ID", 1))
     parser.add_argument("--base-url", default=os.getenv("ETHERSCAN_BASE_URL", "https://api.etherscan.io/v2/api"))
     parser.add_argument("--workers", type=int, default=env_int("ETHERSCAN_WORKERS", 3))
+    parser.add_argument(
+        "--pagination-window",
+        type=int,
+        default=env_int("ETHERSCAN_PAGINATION_WINDOW", 0),
+        help="Maximum ordered page look-ahead; 0 means max(workers, 1)",
+    )
     parser.add_argument("--rate", type=float, default=env_float("ETHERSCAN_RATE", 3.0))
     parser.add_argument("--burst", type=float, default=env_float("ETHERSCAN_BURST", 1.0))
     parser.add_argument("--retries", type=int, default=env_int("ETHERSCAN_RETRIES", 5))
+    parser.add_argument("--backoff-factor", type=float, default=env_float("ETHERSCAN_BACKOFF_FACTOR", 0.5))
+    parser.add_argument("--max-backoff", type=float, default=env_float("ETHERSCAN_MAX_BACKOFF", 30.0))
+    parser.add_argument(
+        "--circuit-failures",
+        type=int,
+        default=env_int("ETHERSCAN_CIRCUIT_FAILURES", 8),
+    )
+    parser.add_argument(
+        "--circuit-recovery",
+        type=float,
+        default=env_float("ETHERSCAN_CIRCUIT_RECOVERY_SEC", 30.0),
+    )
     parser.add_argument("--connect-timeout", type=float, default=env_float("ETHERSCAN_CONNECT_TIMEOUT", 5.0))
     parser.add_argument("--read-timeout", type=float, default=env_float("ETHERSCAN_READ_TIMEOUT", 30.0))
     parser.add_argument("--page-size", type=int, default=env_int("ETHERSCAN_PAGE_SIZE", 1000))
@@ -760,12 +856,16 @@ def install_signal_handlers(client: EtherscanClient) -> None:
         signal.signal(signal.SIGTERM, handle_signal)
 
 
-def open_output(path: Optional[Path]) -> Optional[TextIO]:
+def open_output(path: Optional[Path]) -> Optional[AtomicOutput]:
     if path is None:
         return None
-    path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.open("w", encoding="utf-8", newline="\n")
+    final_path = path.expanduser().resolve()
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = final_path.with_name(
+        f".{final_path.name}.{os.getpid()}.{time.monotonic_ns()}.part"
+    )
+    stream = temp_path.open("x", encoding="utf-8", newline="\n")
+    return AtomicOutput(final_path=final_path, temp_path=temp_path, stream=stream)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -784,10 +884,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             connect_timeout=args.connect_timeout,
             read_timeout=args.read_timeout,
             retries=args.retries,
+            backoff_factor=args.backoff_factor,
+            max_backoff=args.max_backoff,
             rate_limit_per_sec=args.rate,
             rate_limit_burst=args.burst,
             max_workers=args.workers,
+            pagination_window=args.pagination_window,
             page_size=args.page_size,
+            circuit_breaker_failures=args.circuit_failures,
+            circuit_breaker_recovery_sec=args.circuit_recovery,
             proxies=build_proxy_mapping(),
             trust_env=not args.no_trust_env,
         )
@@ -798,7 +903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.skip_balance:
                 LOGGER.info("Native balance: %s", client.get_balance())
 
-            output = open_output(args.output)
+            output_handle = open_output(args.output)
             try:
                 record_count = 0
                 records = client.iter_account_records(
@@ -812,14 +917,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     contract_address=args.contract_address,
                 )
                 for record_count, record in enumerate(records, start=1):
-                    if output is not None:
-                        output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-                        output.write("\n")
+                    if output_handle is not None:
+                        output_handle.stream.write(
+                            json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                        )
+                        output_handle.stream.write("\n")
                     if record_count <= args.print_first:
                         print(json.dumps(record, ensure_ascii=False, indent=2))
-            finally:
-                if output is not None:
-                    output.close()
+                if output_handle is not None:
+                    output_handle.commit()
+            except BaseException:
+                if output_handle is not None:
+                    output_handle.abort()
+                raise
 
             LOGGER.info("Records fetched: %d", record_count)
             if args.output:
