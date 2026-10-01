@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production-oriented multichain Etherscan API V2 client (v4).
+Production-oriented multichain Etherscan API V2 client (v5).
 
 Highlights
 ----------
@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -49,7 +50,7 @@ import requests
 from dotenv import load_dotenv
 from requests import Response, Session
 from requests.adapters import HTTPAdapter
-from requests.exceptions import JSONDecodeError, RequestException
+from requests.exceptions import RequestException
 
 
 load_dotenv()
@@ -172,6 +173,16 @@ class AtomicOutput:
         self.stream.close()
 
         os.replace(self.temp_path, self.final_path)
+
+        # Persist the directory entry as well as the file contents where the
+        # platform supports directory fsync (important after a power loss).
+        if os.name == "posix":
+            dir_fd = os.open(self.final_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+
         self._finished = True
 
     def abort(self) -> None:
@@ -204,7 +215,7 @@ class TokenBucketRateLimiter:
         rate: float,
         capacity: Optional[float] = None,
     ) -> None:
-        if not rate > 0:
+        if not math.isfinite(rate) or not rate > 0:
             raise EtherscanValidationError(
                 "rate_limit_per_sec must be > 0"
             )
@@ -214,7 +225,7 @@ class TokenBucketRateLimiter:
             capacity if capacity is not None else max(1.0, rate)
         )
 
-        if self._capacity < 1.0:
+        if not math.isfinite(self._capacity) or self._capacity < 1.0:
             raise EtherscanValidationError(
                 "rate_limit_burst must be >= 1"
             )
@@ -369,9 +380,15 @@ class CircuitBreaker:
                 return
 
             self._failures = 0
-            self._opened_at = None
-            self._probe_owner = None
-            self._generation += 1
+
+            if lease.probe:
+                # Only a successful HALF_OPEN probe changes generations.
+                # Normal CLOSED-state successes must not invalidate leases
+                # held by concurrent requests, otherwise their failures can
+                # be silently discarded.
+                self._opened_at = None
+                self._probe_owner = None
+                self._generation += 1
 
     def record_failure(self, lease: CircuitLease) -> None:
         with self._lock:
@@ -426,7 +443,7 @@ class EtherscanConfig:
     circuit_breaker_failures: int = 8
     circuit_breaker_recovery_sec: float = 30.0
 
-    user_agent: str = "etherscan-v2-client/4.0"
+    user_agent: str = "etherscan-v2-client/5.0"
 
     proxies: Optional[Mapping[str, str]] = None
     trust_env: bool = True
@@ -456,6 +473,21 @@ class EtherscanConfig:
                 "base_url must contain a hostname"
             )
 
+        finite_fields = {
+            "connect_timeout": self.connect_timeout,
+            "read_timeout": self.read_timeout,
+            "backoff_factor": self.backoff_factor,
+            "max_backoff": self.max_backoff,
+            "rate_limit_per_sec": self.rate_limit_per_sec,
+            "rate_limit_burst": self.rate_limit_burst,
+            "circuit_breaker_recovery_sec": self.circuit_breaker_recovery_sec,
+        }
+        for name, value in finite_fields.items():
+            if not math.isfinite(value):
+                raise EtherscanValidationError(
+                    f"{name} must be finite"
+                )
+
         if self.connect_timeout <= 0:
             raise EtherscanValidationError(
                 "connect_timeout must be > 0"
@@ -479,6 +511,16 @@ class EtherscanConfig:
         if self.max_backoff <= 0:
             raise EtherscanValidationError(
                 "max_backoff must be > 0"
+            )
+
+        if self.rate_limit_per_sec <= 0:
+            raise EtherscanValidationError(
+                "rate_limit_per_sec must be > 0"
+            )
+
+        if self.rate_limit_burst < 1:
+            raise EtherscanValidationError(
+                "rate_limit_burst must be >= 1"
             )
 
         if self.max_workers < 1:
@@ -696,9 +738,6 @@ class EtherscanClient:
                     ),
                 )
 
-                if response.status_code == 429:
-                    self._inc_stat("rate_limits")
-
                 if response.status_code in TRANSIENT_HTTP_STATUSES:
                     raise EtherscanRequestError(
                         f"Transient HTTP "
@@ -742,7 +781,6 @@ class EtherscanClient:
 
             except (
                 RequestException,
-                JSONDecodeError,
                 EtherscanRequestError,
             ) as exc:
                 last_error = exc
@@ -800,12 +838,15 @@ class EtherscanClient:
         try:
             payload = response.json()
         except ValueError as exc:
-            raise EtherscanResponseError(
+            # A 2xx response with malformed JSON is generally an upstream or
+            # intermediary failure, so treat it as retryable rather than as a
+            # permanent API error.
+            raise EtherscanRequestError(
                 "Etherscan returned invalid JSON"
             ) from exc
 
         if not isinstance(payload, dict):
-            raise EtherscanResponseError(
+            raise EtherscanRequestError(
                 "Expected JSON object, got "
                 f"{type(payload).__name__}"
             )
