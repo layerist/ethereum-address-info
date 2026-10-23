@@ -39,7 +39,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, getcontext
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import FrameType
@@ -54,8 +54,6 @@ from requests.exceptions import RequestException
 
 
 load_dotenv()
-getcontext().prec = 80
-
 LOGGER = logging.getLogger("etherscan")
 
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -256,7 +254,9 @@ class TokenBucketRateLimiter:
 
             # Drain accumulated burst capacity.
             self._tokens = 0.0
-            self._updated_at = now
+            # Do not refill the bucket *during* a server-mandated pause.
+            # Otherwise all workers can burst immediately on recovery.
+            self._updated_at = self._blocked_until
 
     def acquire(self, stop_event: threading.Event) -> None:
         while True:
@@ -456,7 +456,7 @@ class EtherscanConfig:
 
         validate_address(self.address)
 
-        if self.chain_id <= 0:
+        if isinstance(self.chain_id, bool) or not isinstance(self.chain_id, int) or self.chain_id <= 0:
             raise EtherscanValidationError(
                 "chain_id must be > 0"
             )
@@ -468,10 +468,14 @@ class EtherscanConfig:
                 "base_url must use HTTP or HTTPS"
             )
 
-        if not parsed.netloc:
+        if not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
             raise EtherscanValidationError(
-                "base_url must contain a hostname"
+                "base_url must have a hostname and no credentials or fragment"
             )
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise EtherscanValidationError("base_url has an invalid port") from exc
 
         finite_fields = {
             "connect_timeout": self.connect_timeout,
@@ -498,7 +502,7 @@ class EtherscanConfig:
                 "read_timeout must be > 0"
             )
 
-        if self.retries < 1:
+        if isinstance(self.retries, bool) or not isinstance(self.retries, int) or self.retries < 1:
             raise EtherscanValidationError(
                 "retries must be >= 1"
             )
@@ -523,22 +527,22 @@ class EtherscanConfig:
                 "rate_limit_burst must be >= 1"
             )
 
-        if self.max_workers < 1:
+        if isinstance(self.max_workers, bool) or not isinstance(self.max_workers, int) or self.max_workers < 1:
             raise EtherscanValidationError(
                 "max_workers must be >= 1"
             )
 
-        if self.pagination_window < 0:
+        if isinstance(self.pagination_window, bool) or not isinstance(self.pagination_window, int) or self.pagination_window < 0:
             raise EtherscanValidationError(
                 "pagination_window must be >= 0"
             )
 
-        if not 1 <= self.page_size <= 1000:
+        if isinstance(self.page_size, bool) or not isinstance(self.page_size, int) or not 1 <= self.page_size <= 1000:
             raise EtherscanValidationError(
                 "page_size must be between 1 and 1000"
             )
 
-        if self.circuit_breaker_failures < 1:
+        if isinstance(self.circuit_breaker_failures, bool) or not isinstance(self.circuit_breaker_failures, int) or self.circuit_breaker_failures < 1:
             raise EtherscanValidationError(
                 "circuit_breaker_failures must be >= 1"
             )
@@ -686,8 +690,15 @@ class EtherscanClient:
 
         self._thread_local.session = session
 
-        with self._sessions_lock:
-            self._sessions.append(session)
+        # Register only while the client is open: otherwise close() can
+        # drain the session list just before a new session is appended.
+        with self._state_lock:
+            if self._closed:
+                session.close()
+                self._thread_local.session = None
+                raise EtherscanError("Client is closed")
+            with self._sessions_lock:
+                self._sessions.append(session)
 
         return session
 
@@ -720,8 +731,6 @@ class EtherscanClient:
             if self._stop_event.is_set():
                 raise KeyboardInterrupt
 
-            self._inc_stat("requests")
-
             self._rate_limiter.acquire(
                 self._stop_event
             )
@@ -729,13 +738,17 @@ class EtherscanClient:
             response: Optional[Response] = None
 
             try:
-                response = self._session().get(
+                session = self._session()
+                self._inc_stat("requests")
+                response = session.get(
                     self.config.base_url,
                     params=query,
                     timeout=(
                         self.config.connect_timeout,
                         self.config.read_timeout,
                     ),
+                    # A user-selected proxy must override environment proxies.
+                    **({"proxies": dict(self.config.proxies)} if self.config.proxies else {}),
                 )
 
                 if response.status_code in TRANSIENT_HTTP_STATUSES:
@@ -743,6 +756,13 @@ class EtherscanClient:
                         f"Transient HTTP "
                         f"{response.status_code}: "
                         f"{response.text[:300]!r}"
+                    )
+
+                # Do not repeat permanent client-side HTTP failures.
+                if 400 <= response.status_code < 500:
+                    raise EtherscanResponseError(
+                        f"Non-retryable HTTP {response.status_code}: "
+                        f"{self._redact(response.text[:300])!r}"
                     )
 
                 response.raise_for_status()
@@ -772,11 +792,9 @@ class EtherscanClient:
                 return result
 
             except EtherscanResponseError:
-                # A valid permanent API error does not imply
-                # upstream infrastructure failure.
-                self._circuit_breaker.record_success(
-                    lease
-                )
+                # Permanent API/4xx errors are not upstream outages.
+                self._inc_stat("failed_requests")
+                self._circuit_breaker.record_success(lease)
                 raise
 
             except (
@@ -785,24 +803,24 @@ class EtherscanClient:
             ) as exc:
                 last_error = exc
 
-                if attempt + 1 >= self.config.retries:
-                    break
-
-                delay = self._retry_delay(
-                    attempt,
-                    response,
-                )
-
                 is_rate_limited = (
                     response is not None
                     and response.status_code == 429
                 ) or self._looks_like_rate_limit(exc)
-
                 if is_rate_limited:
                     self._inc_stat("rate_limits")
-                    self._rate_limiter.defer_for(
-                        delay
-                    )
+
+                # A final 429 must also pause *other* workers.
+                if attempt + 1 >= self.config.retries:
+                    if is_rate_limited:
+                        self._rate_limiter.defer_for(
+                            self._retry_delay(attempt, response)
+                        )
+                    break
+
+                delay = self._retry_delay(attempt, response)
+                if is_rate_limited:
+                    self._rate_limiter.defer_for(delay)
 
                 self._inc_stat("retries")
 
@@ -828,8 +846,12 @@ class EtherscanClient:
         raise EtherscanRequestError(
             f"Request failed after "
             f"{self.config.retries} attempts: "
-            f"{last_error}"
+            f"{self._redact(str(last_error))}"
         ) from last_error
+
+    def _redact(self, message: str) -> str:
+        """Avoid exposing API keys in HTTP/network errors and logs."""
+        return message.replace(self.config.api_key, "***")
 
     @staticmethod
     def _decode_response(
@@ -965,12 +987,12 @@ class EtherscanClient:
             return None
 
         try:
-            return max(
-                0.0,
-                float(value.strip()),
-            )
+            seconds = float(value.strip())
         except ValueError:
             pass
+        else:
+            # NaN/Inf can cause Event.wait() to fail or stall forever.
+            return max(0.0, seconds) if math.isfinite(seconds) else None
 
         try:
             target = parsedate_to_datetime(
@@ -1006,7 +1028,7 @@ class EtherscanClient:
             self.config.retries,
             query.get("module"),
             query.get("action"),
-            error,
+            self._redact(str(error)),
             delay,
         )
 
@@ -1015,7 +1037,7 @@ class EtherscanClient:
         value: str | int,
         decimals: int = 18,
     ) -> Decimal:
-        if not 0 <= decimals <= 255:
+        if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 255:
             raise EtherscanValidationError(
                 "decimals must be between 0 and 255"
             )
@@ -1026,17 +1048,20 @@ class EtherscanClient:
             raise EtherscanResponseError(
                 f"Invalid numeric result: {value!r}"
             ) from exc
+        if not numeric.is_finite():
+            raise EtherscanResponseError(f"Non-finite numeric result: {value!r}")
 
-        return numeric / (
-            Decimal(10) ** decimals
-        )
+        # Construct an exact scaled Decimal, independent of the caller's
+        # decimal context precision (even for very large token balances).
+        sign, digits, exponent = numeric.as_tuple()
+        return Decimal((sign, digits, exponent - decimals))
 
     def get_balance(
         self,
         address: Optional[str] = None,
     ) -> Decimal:
         target = normalize_address(
-            address or self.config.address
+            self.config.address if address is None else address
         )
 
         value = self._request({
@@ -1060,7 +1085,7 @@ class EtherscanClient:
         )
 
         target = normalize_address(
-            address or self.config.address
+            self.config.address if address is None else address
         )
 
         value = self._request({
@@ -1108,11 +1133,11 @@ class EtherscanClient:
         )
 
         target = normalize_address(
-            address or self.config.address
+            self.config.address if address is None else address
         )
 
         if (
-            contract_address
+            contract_address is not None
             and action not in TOKEN_ACTIONS
         ):
             raise EtherscanValidationError(
@@ -1125,7 +1150,7 @@ class EtherscanClient:
                 contract_address,
                 field="contract_address",
             )
-            if contract_address
+            if contract_address is not None
             else None
         )
 
@@ -1187,7 +1212,7 @@ class EtherscanClient:
             sort,
         )
 
-        if max_pages is not None and max_pages < 1:
+        if max_pages is not None and (isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1):
             raise EtherscanValidationError(
                 "max_pages must be >= 1 or None"
             )
@@ -1196,6 +1221,14 @@ class EtherscanClient:
             raise EtherscanValidationError(
                 f"Unsupported account action: {action!r}"
             )
+        # Fail before creating executor threads (or making any API calls).
+        normalize_address(self.config.address if address is None else address)
+        if contract_address is not None:
+            if action not in TOKEN_ACTIONS:
+                raise EtherscanValidationError(
+                    f"contract_address filter is not supported for action {action!r}"
+                )
+            normalize_address(contract_address, field="contract_address")
 
         kwargs = {
             "action": action,
@@ -1353,17 +1386,10 @@ class EtherscanClient:
         next_submit = 1
         next_emit = 1
 
-        terminal_page: Optional[int] = None
-
-        completed: dict[
-            int,
-            list[dict[str, Any]],
-        ] = {}
-
-        in_flight: dict[
-            Future[list[dict[str, Any]]],
-            int,
-        ] = {}
+        # Completed speculative pages are buffered, including exceptions.
+        # An error beyond the first short page must not fail the export.
+        completed: dict[int, Future[list[dict[str, Any]]]] = {}
+        in_flight: dict[Future[list[dict[str, Any]]], int] = {}
 
         executor = ThreadPoolExecutor(
             max_workers=workers,
@@ -1371,22 +1397,11 @@ class EtherscanClient:
         )
 
         def can_submit(page: int) -> bool:
-            if self._stop_event.is_set():
-                return False
-
-            if (
-                max_pages is not None
-                and page > max_pages
-            ):
-                return False
-
-            if (
-                terminal_page is not None
-                and page > terminal_page
-            ):
-                return False
-
-            return page < next_emit + window
+            return (
+                not self._stop_event.is_set()
+                and (max_pages is None or page <= max_pages)
+                and page < next_emit + window
+            )
 
         def submit(page: int) -> None:
             future = executor.submit(
@@ -1400,92 +1415,51 @@ class EtherscanClient:
                 address=address,
                 contract_address=contract_address,
             )
-
             in_flight[future] = page
 
         try:
-            while (
-                len(in_flight) < workers
-                and can_submit(next_submit)
-            ):
+            while len(in_flight) < workers and can_submit(next_submit):
                 submit(next_submit)
                 next_submit += 1
 
-            while in_flight:
+            while in_flight or completed:
                 if self._stop_event.is_set():
                     raise KeyboardInterrupt
 
-                done, _ = wait(
-                    in_flight,
-                    timeout=0.25,
-                    return_when=FIRST_COMPLETED,
-                )
-
-                if not done:
-                    continue
-
-                for future in done:
-                    page = in_flight.pop(future)
-
-                    # future.result() deliberately propagates
-                    # worker exceptions to the caller.
-                    records = future.result()
-
-                    completed[page] = records
-
-                    self._inc_stat("pages")
-                    self._inc_stat(
-                        "records",
-                        len(records),
+                if in_flight:
+                    done, _ = wait(
+                        in_flight,
+                        timeout=0.25,
+                        return_when=FIRST_COMPLETED,
                     )
+                    for future in done:
+                        completed[in_flight.pop(future)] = future
 
+                # Only inspect results in page order. Out-of-range
+                # speculative failures then remain safely ignored.
+                while next_emit in completed:
+                    future = completed.pop(next_emit)
+                    records = future.result()
+                    self._inc_stat("pages")
+                    self._inc_stat("records", len(records))
                     LOGGER.info(
                         "Fetched %s page %d (%d records)",
-                        action,
-                        page,
-                        len(records),
+                        action, next_emit, len(records),
                     )
-
-                    if len(records) < page_size:
-                        if terminal_page is None:
-                            terminal_page = page
-                        else:
-                            terminal_page = min(
-                                terminal_page,
-                                page,
-                            )
-
-                while next_emit in completed:
-                    records = completed.pop(
-                        next_emit
-                    )
-
                     yield from records
-
                     if len(records) < page_size:
                         return
-
                     next_emit += 1
 
-                while (
-                    len(in_flight) < workers
-                    and can_submit(next_submit)
-                ):
+                while len(in_flight) < workers and can_submit(next_submit):
                     submit(next_submit)
                     next_submit += 1
-
         finally:
-            # Cancel tasks that haven't started yet.
+            # Cancel not-started tasks, then wait for running workers before
+            # the owning client closes their requests.Session objects.
             for future in in_flight:
                 future.cancel()
-
-            # IMPORTANT:
-            # wait=True prevents worker threads from continuing to use
-            # Session objects after EtherscanClient.__exit__ closes them.
-            executor.shutdown(
-                wait=True,
-                cancel_futures=True,
-            )
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def validate_address(
@@ -1522,23 +1496,23 @@ def validate_page_arguments(
     end_block: int,
     sort: str,
 ) -> None:
-    if page < 1:
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
         raise EtherscanValidationError(
             "page must be >= 1"
         )
 
-    if not 1 <= offset <= 1000:
+    if isinstance(offset, bool) or not isinstance(offset, int) or not 1 <= offset <= 1000:
         raise EtherscanValidationError(
             "offset/page_size must be "
             "between 1 and 1000"
         )
 
-    if start_block < 0:
+    if isinstance(start_block, bool) or not isinstance(start_block, int) or start_block < 0:
         raise EtherscanValidationError(
             "start_block must be >= 0"
         )
 
-    if end_block < start_block:
+    if isinstance(end_block, bool) or not isinstance(end_block, int) or end_block < start_block:
         raise EtherscanValidationError(
             "end_block must be >= start_block"
         )
@@ -1637,10 +1611,12 @@ def build_proxy_mapping() -> Optional[dict[str, str]]:
             "http/https/socks5/socks5h"
         )
 
-    if not parsed.netloc:
-        raise EtherscanValidationError(
-            "ETHERSCAN_PROXY is invalid"
-        )
+    if not parsed.hostname or parsed.fragment:
+        raise EtherscanValidationError("ETHERSCAN_PROXY is invalid")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise EtherscanValidationError("ETHERSCAN_PROXY has an invalid port") from exc
 
     return {
         "http": explicit,
@@ -2027,13 +2003,22 @@ def main(
             )
 
         if (
-            args.contract_address
+            args.contract_address is not None
             and args.action not in TOKEN_ACTIONS
         ):
             raise EtherscanValidationError(
                 "--contract-address can only be "
                 "used with token actions"
             )
+
+        # Validate pagination/filter options before the initial balance call.
+        validate_page_arguments(
+            1, args.page_size, args.start_block, args.end_block, args.sort
+        )
+        if args.contract_address is not None:
+            normalize_address(args.contract_address, field="contract_address")
+        if args.token_contract is not None:
+            normalize_address(args.token_contract, field="token_contract")
 
         config = EtherscanConfig(
             api_key=args.api_key,
