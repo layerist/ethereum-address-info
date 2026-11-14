@@ -41,6 +41,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
+from datetime import timezone
 from pathlib import Path
 from types import FrameType
 from typing import Any, Iterator, Mapping, Optional, Sequence, TextIO, TypedDict, cast
@@ -171,17 +172,24 @@ class AtomicOutput:
         self.stream.close()
 
         os.replace(self.temp_path, self.final_path)
-
-        # Persist the directory entry as well as the file contents where the
-        # platform supports directory fsync (important after a power loss).
-        if os.name == "posix":
-            dir_fd = os.open(self.final_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-
         self._finished = True
+
+        # Once replace succeeds, the output is committed. Directory fsync is
+        # best-effort because some filesystems do not support it; failures
+        # must not turn a successful replacement into an apparent failure.
+        if os.name == "posix":
+            try:
+                dir_fd = os.open(self.final_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as exc:
+                LOGGER.warning(
+                    "Output saved, but directory sync failed for %s: %s",
+                    self.final_path.parent,
+                    exc,
+                )
 
     def abort(self) -> None:
         if self._finished:
@@ -258,9 +266,13 @@ class TokenBucketRateLimiter:
             # Otherwise all workers can burst immediately on recovery.
             self._updated_at = self._blocked_until
 
-    def acquire(self, stop_event: threading.Event) -> None:
+    def acquire(
+        self,
+        stop_event: threading.Event,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
         while True:
-            if stop_event.is_set():
+            if stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 raise KeyboardInterrupt
 
             with self._lock:
@@ -287,7 +299,9 @@ class TokenBucketRateLimiter:
 
                     delay = (1.0 - self._tokens) / self._rate
 
-            if stop_event.wait(delay):
+            # A speculative page may be canceled independently of the client.
+            # Poll briefly only for that case; serial requests keep an exact wait.
+            if stop_event.wait(min(delay, 0.25) if cancel_event is not None else delay):
                 raise KeyboardInterrupt
 
 
@@ -374,6 +388,18 @@ class CircuitBreaker:
                 "Circuit breaker half-open probe in progress"
             )
 
+    def assert_can_continue(self, lease: CircuitLease) -> None:
+        """Reject retries from leases invalidated by a newer circuit opening."""
+        with self._lock:
+            if lease.generation != self._generation:
+                raise EtherscanCircuitOpenError(
+                    "Circuit breaker changed while request was pending"
+                )
+            if self._opened_at is not None and not lease.probe:
+                raise EtherscanCircuitOpenError(
+                    "Circuit breaker opened while request was pending"
+                )
+
     def record_success(self, lease: CircuitLease) -> None:
         with self._lock:
             if lease.generation != self._generation:
@@ -449,7 +475,7 @@ class EtherscanConfig:
     trust_env: bool = True
 
     def validate(self) -> None:
-        if not self.api_key.strip():
+        if not isinstance(self.api_key, str) or not self.api_key.strip():
             raise EtherscanValidationError(
                 "ETHERSCAN_API_KEY is missing"
             )
@@ -461,7 +487,12 @@ class EtherscanConfig:
                 "chain_id must be > 0"
             )
 
-        parsed = urlparse(self.base_url)
+        if not isinstance(self.base_url, str):
+            raise EtherscanValidationError("base_url must be a URL string")
+        try:
+            parsed = urlparse(self.base_url)
+        except ValueError as exc:
+            raise EtherscanValidationError("base_url is invalid") from exc
 
         if parsed.scheme not in {"http", "https"}:
             raise EtherscanValidationError(
@@ -476,6 +507,14 @@ class EtherscanConfig:
             _ = parsed.port
         except ValueError as exc:
             raise EtherscanValidationError("base_url has an invalid port") from exc
+
+        if (
+            not isinstance(self.user_agent, str)
+            or not self.user_agent.strip()
+            or "\r" in self.user_agent
+            or "\n" in self.user_agent
+        ):
+            raise EtherscanValidationError("user_agent must be a nonempty HTTP header value")
 
         finite_fields = {
             "connect_timeout": self.connect_timeout,
@@ -626,6 +665,12 @@ class EtherscanClient:
 
         return snapshot
 
+    def _interrupted(self) -> bool:
+        cancel_event = getattr(self._thread_local, "cancel_event", None)
+        return self._stop_event.is_set() or (
+            cancel_event is not None and cancel_event.is_set()
+        )
+
     def _ensure_open(self) -> None:
         with self._state_lock:
             if self._closed:
@@ -728,12 +773,16 @@ class EtherscanClient:
         last_error: Optional[BaseException] = None
 
         for attempt in range(self.config.retries):
-            if self._stop_event.is_set():
+            if self._interrupted():
                 raise KeyboardInterrupt
 
             self._rate_limiter.acquire(
-                self._stop_event
+                self._stop_event,
+                getattr(self._thread_local, "cancel_event", None),
             )
+            if self._interrupted():
+                raise KeyboardInterrupt
+            self._circuit_breaker.assert_can_continue(lease)
 
             response: Optional[Response] = None
 
@@ -749,7 +798,14 @@ class EtherscanClient:
                     ),
                     # A user-selected proxy must override environment proxies.
                     **({"proxies": dict(self.config.proxies)} if self.config.proxies else {}),
+                    # Do not forward a query-string API key through redirects.
+                    allow_redirects=False,
                 )
+
+                if 300 <= response.status_code < 400:
+                    raise EtherscanResponseError(
+                        f"Unexpected HTTP redirect ({response.status_code})"
+                    )
 
                 if response.status_code in TRANSIENT_HTTP_STATUSES:
                     raise EtherscanRequestError(
@@ -780,6 +836,9 @@ class EtherscanClient:
                         "Retryable Etherscan response: "
                         f"{payload.get('result')!r}"
                     )
+
+                if self._interrupted():
+                    raise KeyboardInterrupt
 
                 self._inc_stat(
                     "successful_requests"
@@ -913,10 +972,12 @@ class EtherscanClient:
             return False, []
 
         raise EtherscanResponseError(
-            "Etherscan error: "
-            f"status={status!r}, "
-            f"message={message!r}, "
-            f"result={result!r}"
+            self._redact(
+                "Etherscan error: "
+                f"status={status!r}, "
+                f"message={message!r}, "
+                f"result={result!r}"
+            )
         )
 
     @staticmethod
@@ -947,11 +1008,9 @@ class EtherscanClient:
                 2.0,
             )
 
-            return min(
-                retry_after
-                + random.uniform(0.0, jitter),
-                self.config.max_backoff,
-            )
+            # Retry-After is a server-specified minimum, not an exponential
+            # backoff suggestion. Do not cap it at max_backoff.
+            return retry_after + random.uniform(0.0, jitter)
 
         base = min(
             self.config.backoff_factor
@@ -998,6 +1057,8 @@ class EtherscanClient:
             target = parsedate_to_datetime(
                 value
             )
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
 
             return max(
                 0.0,
@@ -1011,8 +1072,20 @@ class EtherscanClient:
             return None
 
     def _wait(self, delay: float) -> None:
-        if self._stop_event.wait(delay):
-            raise KeyboardInterrupt
+        # Interrupt speculative backoff promptly after the terminal page.
+        cancel_event = getattr(self._thread_local, "cancel_event", None)
+        deadline = time.monotonic() + delay
+        while True:
+            if self._stop_event.is_set() or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise KeyboardInterrupt
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            interval = min(remaining, 0.25) if cancel_event is not None else remaining
+            if self._stop_event.wait(interval):
+                raise KeyboardInterrupt
 
     def _log_retry(
         self,
@@ -1390,6 +1463,7 @@ class EtherscanClient:
         # An error beyond the first short page must not fail the export.
         completed: dict[int, Future[list[dict[str, Any]]]] = {}
         in_flight: dict[Future[list[dict[str, Any]]], int] = {}
+        cancel_speculative = threading.Event()
 
         executor = ThreadPoolExecutor(
             max_workers=workers,
@@ -1403,18 +1477,26 @@ class EtherscanClient:
                 and page < next_emit + window
             )
 
+        def fetch_page(page: int) -> list[dict[str, Any]]:
+            # This cancellation scope belongs to one pagination run, not the
+            # whole client: stopping unused pages must not prevent reuse.
+            self._thread_local.cancel_event = cancel_speculative
+            try:
+                return self.get_account_page(
+                    action,
+                    page,
+                    offset=page_size,
+                    start_block=start_block,
+                    end_block=end_block,
+                    sort=sort,
+                    address=address,
+                    contract_address=contract_address,
+                )
+            finally:
+                self._thread_local.cancel_event = None
+
         def submit(page: int) -> None:
-            future = executor.submit(
-                self.get_account_page,
-                action,
-                page,
-                offset=page_size,
-                start_block=start_block,
-                end_block=end_block,
-                sort=sort,
-                address=address,
-                contract_address=contract_address,
-            )
+            future = executor.submit(fetch_page, page)
             in_flight[future] = page
 
         try:
@@ -1455,6 +1537,9 @@ class EtherscanClient:
                     submit(next_submit)
                     next_submit += 1
         finally:
+            # Also interrupt backoff / limiter waits in speculative workers.
+            # An already-running HTTP request may still require its timeout.
+            cancel_speculative.set()
             # Cancel not-started tasks, then wait for running workers before
             # the owning client closes their requests.Session objects.
             for future in in_flight:
@@ -2110,6 +2195,11 @@ def main(
                                 indent=2,
                             )
                         )
+
+                # A signal can arrive after the last response but before
+                # commit. Never publish an interrupted export as complete.
+                if client._stop_event.is_set():
+                    raise KeyboardInterrupt
 
                 if output_handle is not None:
                     output_handle.commit()
